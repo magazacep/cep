@@ -1,299 +1,59 @@
-// ================== Mağaza Takip Cep (telefon) ==================
-// Bilgisayardaki Mağaza Takip programının telefona özel, sade yüzü.
-// Veri buluttan şifreli gelir (anahtar QR bağlantısında, # sonrası → sunucuya gitmez); telefonda PIN ile kilitlenir.
-import { pseal, popen, linkHash, unb64u, b64u } from './pcrypto.js';
-import { parseOrderText, splitUnits } from './parse.js';
-
-const $ = (s, r = document) => r.querySelector(s);
-const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const usd = (v) => '$' + (Number(v) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const tl = (v) => (Number(v) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const num = (v) => { if (v == null || v === '') return 0; let s = String(v).trim().replace(/[^\d.,-]/g, ''); if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.'); return Number(s) || 0; };
-const rid = () => b64u(crypto.getRandomValues(new Uint8Array(9)));
-const ago = (iso) => { if (!iso) return '—'; const m = Math.round((Date.now() - new Date(iso)) / 60000); if (m < 1) return 'az önce'; if (m < 60) return `${m} dk önce`; const h = Math.round(m / 60); if (h < 24) return `${h} saat önce`; return new Date(iso).toLocaleString('tr-TR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
-const trDay = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString('tr-TR', { day: 'numeric', month: 'long' }) : '';
-const COUNTRY = { US: 'ABD', GB: 'İngiltere', DE: 'Almanya', FR: 'Fransa', NL: 'Hollanda', IT: 'İtalya', ES: 'İspanya', CA: 'Kanada', AU: 'Avustralya', CH: 'İsviçre', AT: 'Avusturya', BE: 'Belçika', TR: 'Türkiye', SE: 'İsveç', NO: 'Norveç', DK: 'Danimarka', IE: 'İrlanda', PL: 'Polonya', FI: 'Finlandiya', PT: 'Portekiz', NZ: 'Yeni Zelanda', JP: 'Japonya' };
-const cName = (c) => COUNTRY[String(c || '').replace(/-.*/, '')] || c || '';
-const AUTO = ['girildi', 'paylasildi', 'konsi', 'fatura', 'gonderildi', 'konsi_var'];
-const ICON = {
-  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>', list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>', chart: '<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>', gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'
-};
-const icon = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON[n] || ''}</svg>`;
-
-// ---------------------------------------------------------------- yerel saklama (PIN ile şifreli)
-const LS = { cfg: 'mtc.cfg', cache: 'mtc.cache', pend: 'mtc.pend' };
-const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
-const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* özel pencere */ } };
-async function pinKey(pin, salt) {
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(`mtc|${pin}`), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 150000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-}
-async function saveCfg(cfg, pin) {
-  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
-  const d = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await pinKey(pin, salt), new TextEncoder().encode(JSON.stringify(cfg)));
-  lsSet(LS.cfg, JSON.stringify({ s: b64u(salt), i: b64u(iv), d: b64u(d), n: cfg.n }));
-}
-async function loadCfg(pin) {
-  const o = JSON.parse(lsGet(LS.cfg));
-  const p = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(o.i) }, await pinKey(pin, unb64u(o.s)), unb64u(o.d));
-  return JSON.parse(new TextDecoder().decode(p));
-}
-
-// ---------------------------------------------------------------- durum
-const S = { cfg: null, hash: '', view: null, viewAt: '', pend: { steps: [], seen: [], etsy: [], add: [] }, tab: 'today', filter: 'acik', q: '', store: '', err: '', busy: false, parsed: null, box: '' };
-const me = () => S.view?.link?.user?.username || '';
-const role = () => S.view?.link?.role || '';
-const isProd = () => role() === 'producer';
-const storeOf = (id) => S.view?.stores?.find(s => s.id === id);
-const pendCount = () => S.pend.steps.length + S.pend.seen.length + S.pend.etsy.length + S.pend.add.length;
-
-// ---------------------------------------------------------------- bulut
-const H = () => { const k = S.cfg.a; const h = { apikey: k, 'Content-Type': 'application/json' }; if (!k.startsWith('sb_')) h.Authorization = `Bearer ${k}`; return h; };
-async function api(path, opts = {}) {
-  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 20000);
-  try {
-    const r = await fetch(`${S.cfg.u}/rest/v1/${path}`, { ...opts, headers: { ...H(), ...(opts.headers || {}) }, signal: ctrl.signal, cache: 'no-store' });
-    if (!r.ok) throw new Error(`Sunucu ${r.status}`);
-    const tx = await r.text(); return tx ? JSON.parse(tx) : null;
-  } finally { clearTimeout(t); }
-}
-async function pull() {
-  const rows = await api(`mt_packages?select=updated_at,payload&store_hash=eq.${S.hash}&sender=eq.desk`);
-  if (!rows?.length) { S.err = 'Bilgisayardan henüz veri gelmedi. Mağaza Takip programı açık ve bulut ayarlı olmalı.'; return; }
-  if (rows[0].updated_at === S.viewAt && S.view) { S.err = ''; return; }
-  const v = await popen(rows[0].payload, S.cfg.k);
-  if (v.kind !== 'phone-view' || v.link?.id !== S.cfg.i) throw new Error('Bu paket bu telefona ait değil');
-  S.view = v; S.viewAt = rows[0].updated_at; S.err = '';
-  lsSet(LS.cache, await pseal({ v, at: S.viewAt }, S.cfg.k));
-  const ap = new Set(v.applied || []); let pruned = false;
-  for (const k of ['steps', 'seen', 'etsy', 'add']) { const n = S.pend[k].length; S.pend[k] = S.pend[k].filter(x => !ap.has(x.id)); if (S.pend[k].length !== n) pruned = true; }
-  if (pruned) await savePend(false);
-}
-async function push() {
-  const body = { kind: 'phone-changes', v: 1, link: S.cfg.i, at: new Date().toISOString(), ...S.pend };
-  const payload = await pseal(body, S.cfg.k);
-  await api('mt_packages?on_conflict=store_hash,sender', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify([{ store_hash: S.hash, sender: 'phone', updated_at: new Date().toISOString(), size: payload.length, payload }]) });
-}
-let pushT = null;
-async function savePend(send = true) {
-  lsSet(LS.pend, await pseal(S.pend, S.cfg.k));
-  if (send) { clearTimeout(pushT); pushT = setTimeout(() => push().then(() => { S.err = ''; }).catch(e => { S.err = 'Gönderilemedi (internet?): ' + e.message; render(); }), 900); }
-}
-async function refreshNow(quiet) {
-  if (S.busy) return; S.busy = true; if (!quiet) render();
-  try { await pull(); if (pendCount()) await push(); } catch (e) { S.err = navigator.onLine === false ? 'İnternet yok. Değişiklikler telefonda bekliyor.' : 'Bağlanılamadı: ' + e.message; }
-  S.busy = false; render();
-}
-
-// ---------------------------------------------------------------- görünüm yardımcıları (bekleyen değişiklikler dahil)
-function stepsOf(o) {
-  const out = {};
-  for (const t of ['ofis', 'uretim', 'yan']) out[t] = (o.steps[t] || []).map(([k, title, done, at, by]) => {
-    const p = [...S.pend.steps].reverse().find(x => x.o === o.id && x.k === k);
-    return p ? { k, title, done: !!p.done, at: p.at, by: 'sen (gönderiliyor)', pend: true } : { k, title, done: !!done, at, by };
-  });
-  return out;
-}
-const canTick = (o, track) => !!storeOf(o.s)?.ticks?.[track];
-function progress(o) { const st = stepsOf(o); const all = [...st.ofis, ...st.uretim, ...st.yan]; const d = all.filter(x => x.done).length; return { d, t: all.length, pct: all.length ? Math.round(d / all.length * 100) : 0 }; }
-function nextFor(o) {
-  if (o.state === 'teslim') return null; const st = stepsOf(o);
-  for (const t of ['ofis', 'uretim', 'yan']) { if (!canTick(o, t)) continue; const n = st[t].find(x => !x.done && !AUTO.includes(x.k)); if (n) return { ...n, track: t }; }
-  return null;
-}
-const isNew = (o) => !!me() && o.by !== me() && !o.seen?.[me()] && !S.pend.seen.some(x => x.o === o.id);
-const stLabel = { hazir: 'Hazırlanacak', kargo: 'Kargoda', teslim: 'Teslim' };
-const first = (n) => String(n || '').split(' ')[0];
-function orderCard(o, extra = '') {
-  const pg = progress(o); const s = storeOf(o.s);
-  return `<div class="card" data-open="${o.id}"><div class="row"><div class="thumbless">${esc((s?.name || '?').slice(0, 2).toUpperCase())}</div>
-    <div class="grow"><div class="bold ell">${esc(o.cust || '—')} · ${esc(cName(o.country))}</div><div class="small muted ell">${esc([o.title, o.size].filter(Boolean).join(' · ') || o.sku || o.code)}</div></div>
-    <div style="text-align:right">${isNew(o) ? '<span class="pill new">YENİ</span><br>' : ''}${o.review ? '<span class="pill rev">kontrol</span><br>' : ''}<span class="pill st-${o.state}">${stLabel[o.state]}</span>${o.profit != null ? `<div class="small bold" style="color:${o.profit < 0 ? 'var(--red)' : 'var(--green)'}">${usd(o.profit)}</div>` : ''}</div></div>
-    <div class="row" style="margin-top:8px"><div class="bar grow"><i style="width:${pg.pct}%"></i></div><span class="small muted">${pg.d}/${pg.t}</span></div>${extra}</div>`;
-}
-
-// ---------------------------------------------------------------- ekranlar
-function vToday() {
-  const v = S.view; const os = v.orders.filter(o => !S.store || o.s === S.store);
-  const fresh = os.filter(isNew);
-  const todo = os.map(o => ({ o, n: nextFor(o) })).filter(x => x.n).sort((a, b) => (a.o.due || '9') .localeCompare(b.o.due || '9') || (a.o.date || '').localeCompare(b.o.date || '')).slice(0, 25);
-  const sums = (v.sum || []).filter(x => !S.store || x.s === S.store);
-  const tot = sums.reduce((a, x) => ({ rev: a.rev + x.rev, mine: a.mine + x.mine, count: a.count + x.count }), { rev: 0, mine: 0, count: 0 });
-  return `<h2>Merhaba ${esc(first(v.link.user?.name || v.link.name))}</h2>
-    ${v.sum ? `<div class="stats"><div class="card"><div class="k">Bu ay satış</div><div class="v">${usd(tot.rev)}</div><div class="small muted">${tot.count} sipariş</div></div><div class="card"><div class="k">Bu ay elime geçen</div><div class="v" style="color:var(--green)">${usd(tot.mine)}</div><div class="small muted">giderler düşülmüş</div></div></div>` : ''}
-    ${fresh.length ? `<h3>Yeni gelen siparişler (${fresh.length})</h3>${fresh.map(o => orderCard(o, `<button class="btn g w" style="margin-top:10px" data-seen="${o.id}">✓ Gördüm</button>`)).join('')}
-      ${fresh.length > 1 ? `<button class="btn w" data-seenall>Hepsini gördüm</button>` : ''}` : ''}
-    <h3>Sıradaki işler ${todo.length ? `(${todo.length})` : ''}</h3>
-    ${todo.length ? todo.map(({ o, n }) => `<div class="card"><div class="row"><div class="grow"><div class="bold ell">${esc(n.title)}</div><div class="small muted ell">${esc(o.cust || '')} · ${esc(cName(o.country))} · ${esc(o.title || o.sku || '')} ${esc(o.size || '')}</div>${o.due ? `<div class="small" style="color:var(--yellow)">son gönderim ${trDay(o.due)}</div>` : ''}</div>
-      <button class="btn g sm" data-tick="${o.id}|${n.k}|1">✓ Yapıldı</button></div></div>`).join('') : `<div class="empty">Bekleyen iş yok 👍</div>`}`;
-}
-function vOrders() {
-  const v = S.view; const q = S.q.toLocaleLowerCase('tr');
-  let os = v.orders.filter(o => !S.store || o.s === S.store);
-  if (S.filter === 'acik') os = os.filter(o => o.state !== 'teslim'); else if (S.filter !== 'hepsi') os = os.filter(o => o.state === S.filter);
-  if (q) os = os.filter(o => [o.cust, o.code, o.sku, o.title, cName(o.country)].join(' ').toLocaleLowerCase('tr').includes(q));
-  return `<div class="chips">${[['acik', 'Açık'], ['hazir', 'Hazırlanacak'], ['kargo', 'Kargoda'], ['teslim', 'Teslim'], ['hepsi', 'Hepsi']].map(([k, t]) => `<button data-filter="${k}" class="${S.filter === k ? 'on' : ''}">${t}</button>`).join('')}</div>
-    <input id="q" placeholder="Ara: müşteri, SKU, kod…" value="${esc(S.q)}" style="margin-bottom:10px">
-    ${os.length ? os.slice(0, 120).map(o => orderCard(o)).join('') : '<div class="empty">Sipariş yok</div>'}`;
-}
-function vDetail(o) {
-  const st = stepsOf(o); const s = storeOf(o.s);
-  const sec = (t, name) => st[t].length ? `<h3>${name}${canTick(o, t) ? '' : ' · 🔒'}</h3><div class="card">${st[t].map(x => `<div class="step ${x.done ? 'done' : ''} ${canTick(o, t) ? '' : 'lock'}" ${canTick(o, t) ? `data-tick="${o.id}|${x.k}|${x.done ? 0 : 1}"` : ''}><span class="cb">${x.done ? '✓' : ''}</span><div class="grow"><div>${esc(x.title)}</div>${x.done && (x.at || x.by) ? `<div class="w">${esc(x.by || '')} ${x.at ? '· ' + ago(x.at) : ''}</div>` : ''}</div></div>`).join('')}</div>` : '';
-  return `<div class="row"><div class="grow"><div class="bold" style="font-size:18px">${esc(o.cust || '—')}</div><div class="small muted">${esc(s?.name || '')} · ${esc(o.code || '')} · ${trDay(o.date)}</div></div><button class="btn sm" data-close>Kapat</button></div>
-    ${isNew(o) ? `<button class="btn g w" style="margin-top:12px" data-seen="${o.id}">✓ Gördüm</button>` : ''}
-    ${o.review ? `<div class="card warn" style="margin-top:12px">Telefondan eklendi; bilgisayarda maliyeti kontrol edilecek.</div>` : ''}
-    <div class="card" style="margin-top:12px"><div class="bold">${esc(o.title || '—')}</div>
-      <div class="small">${[o.size && `Ölçü: <b>${esc(o.size)}</b>`, o.sku && `SKU: <b>${esc(o.sku)}</b>`, o.feat && esc(o.feat), o.part && `Parça: ${esc(o.part)}`].filter(Boolean).join('<br>')}</div>
-      <div class="small muted" style="margin-top:6px">${esc(cName(o.country))}${o.due ? ` · son gönderim <b>${trDay(o.due)}</b>` : ''}</div>
-      ${o.note ? `<div class="card warn small" style="margin:8px 0 0">${esc(o.note)}</div>` : ''}
-      ${o.sub != null ? `<div class="row small" style="margin-top:8px"><span>Satış <b>${usd(o.sub)}</b></span><span>Kâr <b style="color:${o.profit < 0 ? 'var(--red)' : 'var(--green)'}">${usd(o.profit)}</b></span>${o.track ? `<span class="ell">Takip: ${esc(o.track)}</span>` : ''}</div>` : ''}</div>
-    ${sec('uretim', 'Üretim')}${sec('ofis', 'Ofis')}${sec('yan', 'Yan işler')}`;
-}
-function vAdd() {
-  const ms = S.view.stores.filter(s => s.manage);
-  if (!ms.length) return '<div class="empty">Sipariş ekleme yetkin olan mağaza yok.</div>';
-  const p = S.parsed; let pv = '';
-  if (p) {
-    const units = splitUnits(p);
-    pv = `<div class="card ${p.missing?.length ? 'warn' : ''}"><div class="bold">${esc(p.buyerName || 'Alıcı bulunamadı')} · ${esc(cName(p.country))}</div>
-      <div class="small muted">Etsy #${esc(p.orderNo || '?')} · ${esc(p.orderDate || '')}</div>
-      ${(p.items || []).map(it => `<div class="small" style="margin-top:6px">• ${esc(String(it.title || '').split(',')[0].slice(0, 60))}${it.wCm ? ` · ${it.wCm}×${it.hCm}` : ''}${it.sku ? ` · <b>${esc(it.sku)}</b>` : ''}${it.qty > 1 ? ` · ${it.qty} adet` : ''}</div>`).join('')}
-      <div class="small" style="margin-top:6px">Toplam: <b>${p.money?.itemTotal != null ? usd(p.money.itemTotal) : '—'}</b> · ${units.length} sipariş satırı</div>
-      ${p.missing?.length ? `<div class="small" style="margin-top:6px;color:var(--yellow)">Eksik: ${esc(p.missing.join(', '))} (bilgisayarda tamamlanır)</div>` : ''}</div>
-      ${units.length > 1 ? `<div class="chips"><button data-box="tek" class="${S.box === 'tek' ? 'on' : ''}">Tek kutu</button><button data-box="ayri" class="${S.box === 'ayri' ? 'on' : ''}">Ayrı kutular</button></div>` : ''}
-      <button class="btn g w" id="send-add" ${units.length > 1 && !S.box ? 'disabled' : ''}>Siparişi gönder</button>`;
-  }
-  const pa = S.pend.add;
-  return `<h2>Sipariş ekle</h2>
-    <label class="f">Mağaza<select id="add-s">${ms.map(s => `<option value="${s.id}" ${S.addStore === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></label>
-    <label class="f">Etsy sipariş sayfasının yazısı<textarea id="add-t" placeholder="Etsy uygulamasında siparişi aç → yazıları seç-kopyala (ya da Google Lens ile ekran görüntüsünden metni kopyala) → buraya yapıştır">${esc(S.addText || '')}</textarea></label>
-    <button class="btn p w" id="parse">Oku</button><div style="height:10px"></div>${pv}
-    ${pa.length ? `<h3>Bilgisayara gidiyor (${pa.length})</h3>${pa.map(x => `<div class="card small">${esc(storeOf(x.s)?.name || '')} · ${esc(x.label || '')} <span class="muted">· ${ago(x.at)}</span></div>`).join('')}<div class="small muted">Bilgisayardaki program açıkken birkaç dakikada eklenir; maliyeti orada kontrol edilir.</div>` : ''}`;
-}
-function vEtsy() {
-  const v = S.view; const list = Object.entries(v.etsy || {}).filter(([id]) => !S.store || id === S.store);
-  if (!list.length) return '<div class="empty">Etsy mağazası yok.</div>';
-  return `<h2>Etsy değerleri</h2><div class="small muted" style="margin-bottom:10px">Etsy panelindeki <b>bu ayın toplamını</b> (₺) her gün güncelle.</div>
-    ${list.map(([id, e]) => { const pe = (k) => [...S.pend.etsy].reverse().find(x => x.s === id && x.k === k); const val = (k) => pe(k) ? pe(k).v : e[k];
-      const sales = +val('sales') || 0, cost = (+val('fee') || 0) + (+val('marketing') || 0);
-      return `<div class="card"><div class="row"><div class="grow bold">${esc(storeOf(id)?.name || '')}</div>${sales ? `<span class="pill ${cost / sales * 100 <= 15 ? 'st-teslim' : cost / sales * 100 <= 22 ? 'st-hazir' : 'new'}">%${tl(cost / sales * 100)}</span>` : ''}</div>
-        <div class="small muted" style="margin-bottom:8px">${e.at ? `son: ${ago(e.at)} · ${esc(e.by)}` : 'henüz girilmedi'}</div>
-        ${[['sales', 'Sales'], ['fee', 'Fee'], ['marketing', 'Marketing']].map(([k, t]) => `<label class="f">${t} (₺)<input inputmode="decimal" data-etsy="${id}|${k}" value="${val(k) != null && val(k) !== '' ? tl(val(k)) : ''}" placeholder="0,00"></label>`).join('')}</div>`; }).join('')}
-    <button class="btn p w" id="etsy-save">Kaydet</button>`;
-}
-function vSettings() {
-  const v = S.view;
-  return `<h2>Ayarlar</h2><div class="card"><div class="bold">${esc(v?.link?.name || S.cfg.n || '')}</div><div class="small muted">${{ owner: 'Sahip', manager: 'Ortak / yönetici', producer: 'Üretici / iş takipçisi' }[role()] || ''}</div>
-    <div class="small" style="margin-top:8px">Mağazalar: ${esc((v?.stores || []).map(s => s.name).join(', '))}</div>
-    <div class="small muted" style="margin-top:8px">Bilgisayardan son veri: ${ago(v?.at)}<br>Bekleyen değişiklik: ${pendCount()}</div></div>
+import{pseal as A,popen as O,linkHash as ae,unb64u as L,b64u as z}from"./pcrypto.js";import{parseOrderText as se,splitUnits as ne}from"./parse.js";const o=(e,t=document)=>t.querySelector(e),h=(e,t=document)=>[...t.querySelectorAll(e)],r=e=>String(e??"").replace(/[&<>"']/g,t=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[t]),$=e=>"$"+(Number(e)||0).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2}),R=e=>(Number(e)||0).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2}),ie=e=>{if(e==null||e==="")return 0;let t=String(e).trim().replace(/[^\d.,-]/g,"");return t.includes(",")&&(t=t.replace(/\./g,"").replace(",",".")),Number(t)||0},S=()=>z(crypto.getRandomValues(new Uint8Array(9))),T=e=>{if(!e)return"\u2014";const t=Math.round((Date.now()-new Date(e))/6e4);if(t<1)return"az \xF6nce";if(t<60)return`${t} dk \xF6nce`;const a=Math.round(t/60);return a<24?`${a} saat \xF6nce`:new Date(e).toLocaleString("tr-TR",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})},E=e=>e?new Date(e+"T12:00:00").toLocaleDateString("tr-TR",{day:"numeric",month:"long"}):"",re={US:"ABD",GB:"\u0130ngiltere",DE:"Almanya",FR:"Fransa",NL:"Hollanda",IT:"\u0130talya",ES:"\u0130spanya",CA:"Kanada",AU:"Avustralya",CH:"\u0130svi\xE7re",AT:"Avusturya",BE:"Bel\xE7ika",TR:"T\xFCrkiye",SE:"\u0130sve\xE7",NO:"Norve\xE7",DK:"Danimarka",IE:"\u0130rlanda",PL:"Polonya",FI:"Finlandiya",PT:"Portekiz",NZ:"Yeni Zelanda",JP:"Japonya"},B=e=>re[String(e||"").replace(/-.*/,"")]||e||"",le=["girildi","paylasildi","konsi","fatura","gonderildi","konsi_var"],de={home:'<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>',list:'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',plus:'<path d="M12 5v14M5 12h14"/>',chart:'<path d="M3 3v18h18M7 15l4-4 3 3 5-6"/>',gear:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'},oe=e=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${de[e]||""}</svg>`,v={cfg:"mtc.cfg",cache:"mtc.cache",pend:"mtc.pend"},C=e=>{try{return localStorage.getItem(e)}catch{return null}},g=(e,t)=>{try{t==null?localStorage.removeItem(e):localStorage.setItem(e,t)}catch{}};async function U(e,t){const a=await crypto.subtle.importKey("raw",new TextEncoder().encode(`mtc|${e}`),"PBKDF2",!1,["deriveKey"]);return crypto.subtle.deriveKey({name:"PBKDF2",salt:t,iterations:15e4,hash:"SHA-256"},a,{name:"AES-GCM",length:256},!1,["encrypt","decrypt"])}async function ce(e,t){const a=crypto.getRandomValues(new Uint8Array(16)),n=crypto.getRandomValues(new Uint8Array(12)),i=await crypto.subtle.encrypt({name:"AES-GCM",iv:n},await U(t,a),new TextEncoder().encode(JSON.stringify(e)));g(v.cfg,JSON.stringify({s:z(a),i:z(n),d:z(i),n:e.n}))}async function pe(e){const t=JSON.parse(C(v.cfg)),a=await crypto.subtle.decrypt({name:"AES-GCM",iv:L(t.i)},await U(e,L(t.s)),L(t.d));return JSON.parse(new TextDecoder().decode(a))}const s={cfg:null,hash:"",view:null,viewAt:"",pend:{steps:[],seen:[],etsy:[],add:[]},tab:"today",filter:"acik",q:"",store:"",err:"",busy:!1,parsed:null,box:""},j=()=>s.view?.link?.user?.username||"",_=()=>s.view?.link?.role||"",M=()=>_()==="producer",b=e=>s.view?.stores?.find(t=>t.id===e),D=()=>s.pend.steps.length+s.pend.seen.length+s.pend.etsy.length+s.pend.add.length,ue=()=>{const e=s.cfg.a,t={apikey:e,"Content-Type":"application/json"};return e.startsWith("sb_")||(t.Authorization=`Bearer ${e}`),t};async function F(e,t={}){const a=new AbortController,n=setTimeout(()=>a.abort(),2e4);try{const i=await fetch(`${s.cfg.u}/rest/v1/${e}`,{...t,headers:{...ue(),...t.headers||{}},signal:a.signal,cache:"no-store"});if(!i.ok)throw new Error(`Sunucu ${i.status}`);const d=await i.text();return d?JSON.parse(d):null}finally{clearTimeout(n)}}async function me(){const e=await F(`mt_packages?select=updated_at,payload&store_hash=eq.${s.hash}&sender=eq.desk`);if(!e?.length){s.err="Bilgisayardan hen\xFCz veri gelmedi. Ma\u011Faza Takip program\u0131 a\xE7\u0131k ve bulut ayarl\u0131 olmal\u0131.";return}if(e[0].updated_at===s.viewAt&&s.view){s.err="";return}const t=await O(e[0].payload,s.cfg.k);if(t.kind!=="phone-view"||t.link?.id!==s.cfg.i)throw new Error("Bu paket bu telefona ait de\u011Fil");s.view=t,s.viewAt=e[0].updated_at,s.err="",g(v.cache,await A({v:t,at:s.viewAt},s.cfg.k));const a=new Set(t.applied||[]);let n=!1;for(const i of["steps","seen","etsy","add"]){const d=s.pend[i].length;s.pend[i]=s.pend[i].filter(l=>!a.has(l.id)),s.pend[i].length!==d&&(n=!0)}n&&await k(!1)}async function G(){const e={kind:"phone-changes",v:1,link:s.cfg.i,at:new Date().toISOString(),...s.pend},t=await A(e,s.cfg.k);await F("mt_packages?on_conflict=store_hash,sender",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{store_hash:s.hash,sender:"phone",updated_at:new Date().toISOString(),size:t.length,payload:t}])})}let J=null;async function k(e=!0){g(v.pend,await A(s.pend,s.cfg.k)),e&&(clearTimeout(J),J=setTimeout(()=>G().then(()=>{s.err=""}).catch(t=>{s.err="G\xF6nderilemedi (internet?): "+t.message,u()}),900))}async function w(e){if(!s.busy){s.busy=!0,e||u();try{await me(),D()&&await G()}catch(t){s.err=navigator.onLine===!1?"\u0130nternet yok. De\u011Fi\u015Fiklikler telefonda bekliyor.":"Ba\u011Flan\u0131lamad\u0131: "+t.message}s.busy=!1,u()}}function P(e){const t={};for(const a of["ofis","uretim","yan"])t[a]=(e.steps[a]||[]).map(([n,i,d,l,p])=>{const c=[...s.pend.steps].reverse().find(m=>m.o===e.id&&m.k===n);return c?{k:n,title:i,done:!!c.done,at:c.at,by:"sen (g\xF6nderiliyor)",pend:!0}:{k:n,title:i,done:!!d,at:l,by:p}});return t}const N=(e,t)=>!!b(e.s)?.ticks?.[t];function ve(e){const t=P(e),a=[...t.ofis,...t.uretim,...t.yan],n=a.filter(i=>i.done).length;return{d:n,t:a.length,pct:a.length?Math.round(n/a.length*100):0}}function Y(e){if(e.state==="teslim")return null;const t=P(e);for(const a of["ofis","uretim","yan"]){if(!N(e,a))continue;const n=t[a].find(i=>!i.done&&!le.includes(i.k));if(n)return{...n,track:a}}return null}const f=e=>!!j()&&e.by!==j()&&!e.seen?.[j()]&&!s.pend.seen.some(t=>t.o===e.id),ye={hazir:"Haz\u0131rlanacak",kargo:"Kargoda",teslim:"Teslim"},ge=e=>String(e||"").split(" ")[0];function V(e,t=""){const a=ve(e),n=b(e.s);return`<div class="card" data-open="${e.id}"><div class="row">${I(e,40)}
+    <div class="grow"><div class="bold ell">${r(e.cust||"\u2014")} \xB7 ${r(B(e.country))}</div><div class="small muted ell">${r([e.title,e.size].filter(Boolean).join(" \xB7 ")||e.sku||e.code)}</div></div>
+    <div style="text-align:right">${f(e)?'<span class="pill new">YEN\u0130</span><br>':""}${e.review?'<span class="pill rev">kontrol</span><br>':""}<span class="pill st-${e.state}">${ye[e.state]}</span>${e.profit!=null?`<div class="small bold" style="color:${e.profit<0?"var(--red)":"var(--green)"}">${$(e.profit)}</div>`:""}</div></div>
+    <div class="row" style="margin-top:8px"><div class="bar grow"><i style="width:${a.pct}%"></i></div><span class="small muted">${a.d}/${a.t}</span></div>${t}</div>`}const I=(e,t=64)=>e.img?`<img src="${e.img}" alt="" style="width:${t}px;height:${t}px;object-fit:cover;border-radius:10px;flex:none;background:var(--line)">`:`<div class="thumbless" style="width:${t}px;height:${t}px">${r(e.pcode||(b(e.s)?.name||"?").slice(0,2).toUpperCase())}</div>`;function Q(){return s.view.orders.filter(e=>e.state!=="teslim"&&(!s.store||e.s===s.store)).sort((e,t)=>(e.due||e.ship?.due||"9").localeCompare(t.due||t.ship?.due||"9")||(e.date||"").localeCompare(t.date||"")||(e.created||"").localeCompare(t.created||""))}const K=e=>{const t=Q().findIndex(a=>a.id===e.id);return t<0?"":t+1},x=e=>e==null?"":String(e).replace(".",",");function W(e,t){const a=e.prod||{},n=e.ship||{},i=[],d=a.w&&a.h?`${x(a.w)}\xD7${x(a.h)}${a.d?"\xD7"+x(a.d):""} cm`:e.size||"";return i.push(["\xDCr\xFCn",[a.typeLabel,d,a.feature,a.technique,a.frame,a.color,a.glass].filter(Boolean).join(" \xB7 ")||"\u2014"]),a.print&&i.push(["BESA bask\u0131",`<b>${x(a.print.w)}\xD7${x(a.print.h)} cm + ${x(a.print.pay)} cm pay</b>`]),a.framer&&i.push(["\xC7er\xE7eveci",r(a.framer)]),a.kasa&&i.push([a.rolled?"Kutu":"Kasa",r(a.kasa)]),e.part&&i.push(["Par\xE7a",r(e.part)]),i.push(["Kargo",[n.carrier,n.type,n.desi?n.desi+" desi":"",n.country].filter(Boolean).map(r).join(" \xB7 ")||"\u2014"]),t&&n.track&&i.push(["Takip no",r(n.track)]),`<div class="small" style="margin-top:8px;line-height:1.7">${i.map(([l,p])=>`<div class="row" style="align-items:flex-start;gap:8px"><span class="muted" style="min-width:78px">${l}</span><span class="grow">${l==="\xDCr\xFCn"?r(p):p}</span></div>`).join("")}</div>`}function fe(e){const t=Y(e),a=e.due||e.ship?.due;return`<div class="card" data-open="${e.id}"><div class="row" style="align-items:flex-start">
+    <div style="position:relative">${I(e,72)}<span class="pill" style="position:absolute;top:-6px;left:-6px;background:var(--brand);color:#fff">#${K(e)}</span></div>
+    <div class="grow"><div class="row" style="gap:6px;flex-wrap:wrap">${e.pcode?`<span class="pill" style="background:#ece8fb;color:var(--brand)">Kod ${r(e.pcode)}</span>`:""}${f(e)?'<span class="pill new">YEN\u0130</span>':""}${a?`<span class="pill st-hazir">son ${E(a)}</span>`:""}</div>
+      <div class="bold" style="margin-top:4px">${r(e.sku||"\u2014")}</div><div class="small muted ell">${r(e.name||e.title||"")}</div></div></div>
+    ${W(e,!1)}
+    ${e.note?`<div class="card warn small" style="margin:8px 0 0">${r(e.note)}</div>`:""}
+    ${f(e)?`<button class="btn g w" style="margin-top:10px" data-seen="${e.id}">\u2713 G\xF6rd\xFCm</button>`:t?`<button class="btn g w" style="margin-top:10px" data-tick="${e.id}|${t.k}|1">\u2713 ${r(t.title)}</button>`:""}</div>`}function he(){const e=Q(),t=s.view;return`<h2>\xDCretim s\u0131ras\u0131</h2><div class="small muted" style="margin-bottom:10px">${r(t.link.name||"")} \xB7 ${e.length} a\xE7\u0131k sipari\u015F \xB7 son g\xF6nderim tarihine g\xF6re s\u0131ral\u0131</div>
+    ${e.length?e.map(fe).join(""):'<div class="empty">Bekleyen sipari\u015F yok \u{1F44D}</div>'}`}function $e(e){const t=e.ship||{};if(!t.name&&!t.address)return"";const a=[t.name,t.address,t.phone&&`Tel: ${t.phone}`,t.vat].filter(Boolean).join(`
+`);return`<h3>Kargo etiketi</h3><div class="card"><div class="bold">${r(t.name)}</div><div class="small" style="white-space:pre-line;margin-top:4px">${r(t.address)}</div>
+    ${t.phone?`<div class="small" style="margin-top:4px">Tel: <b>${r(t.phone)}</b></div>`:""}${t.email?`<div class="small">E-posta: ${r(t.email)}</div>`:""}${t.vat?`<div class="small" style="margin-top:4px">${r(t.vat)}</div>`:""}
+    <div class="small muted" style="margin-top:6px">${[t.carrier,t.type,t.desi?t.desi+" desi":"",t.country,t.due?"son g\xF6nderim "+E(t.due):""].filter(Boolean).map(r).join(" \xB7 ")}</div>
+    ${t.included?'<div class="small" style="color:var(--yellow);margin-top:4px">Bu par\xE7a ba\u015Fka bir par\xE7ayla ayn\u0131 kutuda gidiyor.</div>':""}
+    <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:8px"><button class="btn sm p" data-copy="${encodeURIComponent(a)}">Etiket bilgisini kopyala</button>${t.address?`<button class="btn sm" data-copy="${encodeURIComponent(t.address)}">Adres</button>`:""}${t.phone?`<button class="btn sm" data-copy="${encodeURIComponent(t.phone)}">Telefon</button>`:""}</div></div>`}function be(){const e=s.view,t=e.orders.filter(l=>!s.store||l.s===s.store),a=t.filter(f),n=t.map(l=>({o:l,n:Y(l)})).filter(l=>l.n).sort((l,p)=>(l.o.due||"9").localeCompare(p.o.due||"9")||(l.o.date||"").localeCompare(p.o.date||"")).slice(0,25),d=(e.sum||[]).filter(l=>!s.store||l.s===s.store).reduce((l,p)=>({rev:l.rev+p.rev,mine:l.mine+p.mine,count:l.count+p.count}),{rev:0,mine:0,count:0});return`<h2>Merhaba ${r(ge(e.link.user?.name||e.link.name))}</h2>
+    ${e.sum?`<div class="stats"><div class="card"><div class="k">Bu ay sat\u0131\u015F</div><div class="v">${$(d.rev)}</div><div class="small muted">${d.count} sipari\u015F</div></div><div class="card"><div class="k">Bu ay elime ge\xE7en</div><div class="v" style="color:var(--green)">${$(d.mine)}</div><div class="small muted">giderler d\xFC\u015F\xFClm\xFC\u015F</div></div></div>`:""}
+    ${a.length?`<h3>Yeni gelen sipari\u015Fler (${a.length})</h3>${a.map(l=>V(l,`<button class="btn g w" style="margin-top:10px" data-seen="${l.id}">\u2713 G\xF6rd\xFCm</button>`)).join("")}
+      ${a.length>1?'<button class="btn w" data-seenall>Hepsini g\xF6rd\xFCm</button>':""}`:""}
+    <h3>S\u0131radaki i\u015Fler ${n.length?`(${n.length})`:""}</h3>
+    ${n.length?n.map(({o:l,n:p})=>`<div class="card"><div class="row"><div class="grow"><div class="bold ell">${r(p.title)}</div><div class="small muted ell">${r(l.cust||"")} \xB7 ${r(B(l.country))} \xB7 ${r(l.title||l.sku||"")} ${r(l.size||"")}</div>${l.due?`<div class="small" style="color:var(--yellow)">son g\xF6nderim ${E(l.due)}</div>`:""}</div>
+      <button class="btn g sm" data-tick="${l.id}|${p.k}|1">\u2713 Yap\u0131ld\u0131</button></div></div>`).join(""):'<div class="empty">Bekleyen i\u015F yok \u{1F44D}</div>'}`}function ke(){const e=s.view,t=s.q.toLocaleLowerCase("tr");let a=e.orders.filter(n=>!s.store||n.s===s.store);return s.filter==="acik"?a=a.filter(n=>n.state!=="teslim"):s.filter!=="hepsi"&&(a=a.filter(n=>n.state===s.filter)),t&&(a=a.filter(n=>[n.cust,n.code,n.sku,n.title,B(n.country)].join(" ").toLocaleLowerCase("tr").includes(t))),`<div class="chips">${[["acik","A\xE7\u0131k"],["hazir","Haz\u0131rlanacak"],["kargo","Kargoda"],["teslim","Teslim"],["hepsi","Hepsi"]].map(([n,i])=>`<button data-filter="${n}" class="${s.filter===n?"on":""}">${i}</button>`).join("")}</div>
+    <input id="q" placeholder="Ara: m\xFC\u015Fteri, SKU, kod\u2026" value="${r(s.q)}" style="margin-bottom:10px">
+    ${a.length?a.slice(0,120).map(n=>V(n)).join(""):'<div class="empty">Sipari\u015F yok</div>'}`}function Z(e){const t=P(e),a=b(e.s),n=(i,d)=>t[i].length?`<h3>${d}${N(e,i)?"":" \xB7 \u{1F512}"}</h3><div class="card">${t[i].map(l=>`<div class="step ${l.done?"done":""} ${N(e,i)?"":"lock"}" ${N(e,i)?`data-tick="${e.id}|${l.k}|${l.done?0:1}"`:""}><span class="cb">${l.done?"\u2713":""}</span><div class="grow"><div>${r(l.title)}</div>${l.done&&(l.at||l.by)?`<div class="w">${r(l.by||"")} ${l.at?"\xB7 "+T(l.at):""}</div>`:""}</div></div>`).join("")}</div>`:"";return`<div class="row"><div class="grow"><div class="bold" style="font-size:18px">${r(e.cust||"\u2014")}</div><div class="small muted">${r(a?.name||"")} \xB7 ${r(e.code||"")} \xB7 ${E(e.date)}</div></div><button class="btn sm" data-close>Kapat</button></div>
+    ${f(e)?`<button class="btn g w" style="margin-top:12px" data-seen="${e.id}">\u2713 G\xF6rd\xFCm</button>`:""}
+    ${e.review?'<div class="card warn" style="margin-top:12px">Telefondan eklendi; bilgisayarda maliyeti kontrol edilecek.</div>':""}
+    ${e.prod?`<div class="card" style="margin-top:12px"><div class="row" style="align-items:flex-start">${I(e,96)}<div class="grow"><div class="row" style="gap:6px;flex-wrap:wrap">${K(e)?`<span class="pill" style="background:var(--brand);color:#fff">S\u0131ra #${K(e)}</span>`:""}${e.pcode?`<span class="pill" style="background:#ece8fb;color:var(--brand)">Kod ${r(e.pcode)}</span>`:""}</div><div class="bold" style="margin-top:6px">${r(e.sku||"\u2014")}</div><div class="small muted">${r(e.name||"")}</div></div></div>${W(e,!0)}</div>${$e(e)}`:""}
+    ${M()&&e.note?`<div class="card warn small" style="margin-top:12px">${r(e.note)}</div>`:""}
+    <div class="card" style="margin-top:12px;${M()?"display:none":""}"><div class="bold">${r(e.title||"\u2014")}</div>
+      <div class="small">${[e.size&&`\xD6l\xE7\xFC: <b>${r(e.size)}</b>`,e.sku&&`SKU: <b>${r(e.sku)}</b>`,e.feat&&r(e.feat),e.part&&`Par\xE7a: ${r(e.part)}`].filter(Boolean).join("<br>")}</div>
+      <div class="small muted" style="margin-top:6px">${r(B(e.country))}${e.due?` \xB7 son g\xF6nderim <b>${E(e.due)}</b>`:""}</div>
+      ${e.note?`<div class="card warn small" style="margin:8px 0 0">${r(e.note)}</div>`:""}
+      ${e.sub!=null?`<div class="row small" style="margin-top:8px"><span>Sat\u0131\u015F <b>${$(e.sub)}</b></span><span>K\xE2r <b style="color:${e.profit<0?"var(--red)":"var(--green)"}">${$(e.profit)}</b></span>${e.track?`<span class="ell">Takip: ${r(e.track)}</span>`:""}</div>`:""}</div>
+    ${n("uretim","\xDCretim")}${n("ofis","Ofis")}${n("yan","Yan i\u015Fler")}`}function we(){const e=s.view.stores.filter(i=>i.manage);if(!e.length)return'<div class="empty">Sipari\u015F ekleme yetkin olan ma\u011Faza yok.</div>';const t=s.parsed;let a="";if(t){const i=ne(t);a=`<div class="card ${t.missing?.length?"warn":""}"><div class="bold">${r(t.buyerName||"Al\u0131c\u0131 bulunamad\u0131")} \xB7 ${r(B(t.country))}</div>
+      <div class="small muted">Etsy #${r(t.orderNo||"?")} \xB7 ${r(t.orderDate||"")}</div>
+      ${(t.items||[]).map(d=>`<div class="small" style="margin-top:6px">\u2022 ${r(String(d.title||"").split(",")[0].slice(0,60))}${d.wCm?` \xB7 ${d.wCm}\xD7${d.hCm}`:""}${d.sku?` \xB7 <b>${r(d.sku)}</b>`:""}${d.qty>1?` \xB7 ${d.qty} adet`:""}</div>`).join("")}
+      <div class="small" style="margin-top:6px">Toplam: <b>${t.money?.itemTotal!=null?$(t.money.itemTotal):"\u2014"}</b> \xB7 ${i.length} sipari\u015F sat\u0131r\u0131</div>
+      ${t.missing?.length?`<div class="small" style="margin-top:6px;color:var(--yellow)">Eksik: ${r(t.missing.join(", "))} (bilgisayarda tamamlan\u0131r)</div>`:""}</div>
+      ${i.length>1?`<div class="chips"><button data-box="tek" class="${s.box==="tek"?"on":""}">Tek kutu</button><button data-box="ayri" class="${s.box==="ayri"?"on":""}">Ayr\u0131 kutular</button></div>`:""}
+      <button class="btn g w" id="send-add" ${i.length>1&&!s.box?"disabled":""}>Sipari\u015Fi g\xF6nder</button>`}const n=s.pend.add;return`<h2>Sipari\u015F ekle</h2>
+    <label class="f">Ma\u011Faza<select id="add-s">${e.map(i=>`<option value="${i.id}" ${s.addStore===i.id?"selected":""}>${r(i.name)}</option>`).join("")}</select></label>
+    <label class="f">Etsy sipari\u015F sayfas\u0131n\u0131n yaz\u0131s\u0131<textarea id="add-t" placeholder="Etsy uygulamas\u0131nda sipari\u015Fi a\xE7 \u2192 yaz\u0131lar\u0131 se\xE7-kopyala (ya da Google Lens ile ekran g\xF6r\xFCnt\xFCs\xFCnden metni kopyala) \u2192 buraya yap\u0131\u015Ft\u0131r">${r(s.addText||"")}</textarea></label>
+    <button class="btn p w" id="parse">Oku</button><div style="height:10px"></div>${a}
+    ${n.length?`<h3>Bilgisayara gidiyor (${n.length})</h3>${n.map(i=>`<div class="card small">${r(b(i.s)?.name||"")} \xB7 ${r(i.label||"")} <span class="muted">\xB7 ${T(i.at)}</span></div>`).join("")}<div class="small muted">Bilgisayardaki program a\xE7\u0131kken birka\xE7 dakikada eklenir; maliyeti orada kontrol edilir.</div>`:""}`}function xe(){const e=s.view,t=Object.entries(e.etsy||{}).filter(([a])=>!s.store||a===s.store);return t.length?`<h2>Etsy de\u011Ferleri</h2><div class="small muted" style="margin-bottom:10px">Etsy panelindeki <b>bu ay\u0131n toplam\u0131n\u0131</b> (\u20BA) her g\xFCn g\xFCncelle.</div>
+    ${t.map(([a,n])=>{const i=c=>[...s.pend.etsy].reverse().find(m=>m.s===a&&m.k===c),d=c=>i(c)?i(c).v:n[c],l=+d("sales")||0,p=(+d("fee")||0)+(+d("marketing")||0);return`<div class="card"><div class="row"><div class="grow bold">${r(b(a)?.name||"")}</div>${l?`<span class="pill ${p/l*100<=15?"st-teslim":p/l*100<=22?"st-hazir":"new"}">%${R(p/l*100)}</span>`:""}</div>
+        <div class="small muted" style="margin-bottom:8px">${n.at?`son: ${T(n.at)} \xB7 ${r(n.by)}`:"hen\xFCz girilmedi"}</div>
+        ${[["sales","Sales"],["fee","Fee"],["marketing","Marketing"]].map(([c,m])=>`<label class="f">${m} (\u20BA)<input inputmode="decimal" data-etsy="${a}|${c}" value="${d(c)!=null&&d(c)!==""?R(d(c)):""}" placeholder="0,00"></label>`).join("")}</div>`}).join("")}
+    <button class="btn p w" id="etsy-save">Kaydet</button>`:'<div class="empty">Etsy ma\u011Fazas\u0131 yok.</div>'}function Se(){const e=s.view;return`<h2>Ayarlar</h2><div class="card"><div class="bold">${r(e?.link?.name||s.cfg.n||"")}</div><div class="small muted">${{owner:"Sahip",manager:"Ortak / y\xF6netici",producer:"\xDCretici / i\u015F takip\xE7isi"}[_()]||""}</div>
+    <div class="small" style="margin-top:8px">Ma\u011Fazalar: ${r((e?.stores||[]).map(t=>t.name).join(", "))}</div>
+    <div class="small muted" style="margin-top:8px">Bilgisayardan son veri: ${T(e?.at)}<br>Bekleyen de\u011Fi\u015Fiklik: ${D()}</div></div>
     <button class="btn w" id="lock">Kilitle</button><div style="height:10px"></div>
-    <button class="btn w" id="forget" style="color:var(--red)">Bu telefondan bağlantıyı sil</button>
-    <div class="small muted center" style="margin-top:18px">Mağaza Takip Cep · veri uçtan uca şifreli</div>`;
-}
-
-// ---------------------------------------------------------------- çizim
-function render() {
-  const app = $('#app');
-  if (!S.view) { app.innerHTML = `<main><div class="card ${S.err ? 'err' : ''}" style="margin-top:30px">${S.busy ? 'Bilgisayardan veriler alınıyor…' : esc(S.err || 'Bekleniyor…')}</div>${S.busy ? '' : '<button class="btn p w" id="retry">Tekrar dene</button>'}</main>`; $('#retry')?.addEventListener('click', () => refreshNow()); return; }
-  const v = S.view; const canAdd = v.stores.some(s => s.manage); const hasEtsy = !!v.etsy && Object.keys(v.etsy).length;
-  const nNew = v.orders.filter(isNew).length;
-  const tabs = [['today', 'Bugün', 'home', nNew], ['orders', 'Siparişler', 'list'], ...(canAdd ? [['add', 'Ekle', 'plus']] : []), ...(hasEtsy ? [['etsy', 'Etsy', 'chart']] : []), ['set', 'Ayarlar', 'gear']];
-  const body = { today: vToday, orders: vOrders, add: vAdd, etsy: vEtsy, set: vSettings }[S.tab]?.() || '';
-  const pc = pendCount();
-  app.innerHTML = `<header><img src="icon-192.png" alt=""><div class="grow"><div class="t">Mağaza Cep</div><div class="s">${S.busy ? 'yenileniyor…' : `güncel: ${ago(v.at)}`}${pc ? ` · ${pc} değişiklik gönderiliyor` : ''}</div></div>
-    ${v.stores.length > 1 ? `<select id="st" style="width:auto;max-width:42%;background:rgba(255,255,255,.15);color:#fff;border:0;padding:8px"><option value="" style="color:#000">Tüm mağazalar</option>${v.stores.map(s => `<option value="${s.id}" ${S.store === s.id ? 'selected' : ''} style="color:#000">${esc(s.name)}</option>`).join('')}</select>` : ''}
-    <button id="rf">⟳</button></header>
-    <main>${S.err ? `<div class="card warn small">${esc(S.err)}</div>` : ''}${body}</main>
-    <nav>${tabs.map(([k, t, i, b]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${icon(i)}${t}${b ? `<i class="b">${b}</i>` : ''}</button>`).join('')}</nav>`;
-  bind();
-}
-function toast(t) { const d = document.createElement('div'); d.className = 'toast'; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), 2600); }
-function openSheet(id) {
-  const o = S.view.orders.find(x => x.id === id); if (!o) return;
-  const sh = document.createElement('div'); sh.className = 'sheet'; sh.innerHTML = `<div>${vDetail(o)}</div>`; document.body.appendChild(sh);
-  sh.addEventListener('click', (e) => { if (e.target === sh || e.target.closest('[data-close]')) { sh.remove(); render(); return; } const t = e.target.closest('[data-tick],[data-seen]'); if (t) { act(t); sh.querySelector('div').innerHTML = vDetail(o); } });
-}
-async function act(el) {
-  if (el.dataset.tick) {
-    const [o, k, d] = el.dataset.tick.split('|');
-    S.pend.steps.push({ id: rid(), o, k, done: d === '1', at: new Date().toISOString() });
-    // aynı adımın eski bekleyen kayıtları gereksiz
-    const last = new Map(); S.pend.steps.forEach(x => last.set(x.o + x.k, x.id)); S.pend.steps = S.pend.steps.filter(x => last.get(x.o + x.k) === x.id);
-    toast(d === '1' ? 'İşaretlendi ✓' : 'İşaret kaldırıldı'); await savePend();
-  } else if (el.dataset.seen) {
-    if (!S.pend.seen.some(x => x.o === el.dataset.seen)) S.pend.seen.push({ id: rid(), o: el.dataset.seen, at: new Date().toISOString() });
-    toast('Gördüm kaydedildi'); await savePend();
-  }
-}
-function bind() {
-  $$('[data-tab]').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; render(); window.scrollTo(0, 0); });
-  $('#rf')?.addEventListener('click', () => refreshNow());
-  $('#st')?.addEventListener('change', (e) => { S.store = e.target.value; render(); });
-  $$('[data-open]').forEach(c => c.addEventListener('click', (e) => { if (e.target.closest('button')) return; openSheet(c.dataset.open); }));
-  $$('[data-tick],[data-seen]').forEach(b => b.addEventListener('click', async (e) => { e.stopPropagation(); await act(b); render(); }));
-  $('[data-seenall]')?.addEventListener('click', async () => { for (const o of S.view.orders.filter(isNew)) S.pend.seen.push({ id: rid(), o: o.id, at: new Date().toISOString() }); await savePend(); toast('Hepsi görüldü'); render(); });
-  $$('[data-filter]').forEach(b => b.onclick = () => { S.filter = b.dataset.filter; render(); });
-  const q = $('#q'); if (q) q.oninput = () => { S.q = q.value; const pos = q.selectionStart; render(); const n = $('#q'); n.focus(); n.setSelectionRange(pos, pos); };
-  // ekle
-  const at = $('#add-t'); if (at) at.oninput = () => { S.addText = at.value; };
-  $('#add-s')?.addEventListener('change', (e) => { S.addStore = e.target.value; });
-  $('#parse')?.addEventListener('click', () => { const t = $('#add-t').value; if (!t.trim()) return toast('Önce sipariş yazısını yapıştır'); try { S.parsed = parseOrderText(t); S.box = ''; } catch (e) { toast('Okunamadı: ' + e.message); } render(); });
-  $$('[data-box]').forEach(b => b.onclick = () => { S.box = b.dataset.box; render(); });
-  $('#send-add')?.addEventListener('click', async () => {
-    const p = S.parsed; const sid = $('#add-s').value;
-    S.pend.add.push({ id: rid(), s: sid, text: S.addText, box: S.box || '', at: new Date().toISOString(), label: `${p.buyerName || ''} #${p.orderNo || ''}` });
-    S.parsed = null; S.addText = ''; S.box = ''; await savePend(); toast('Gönderildi, bilgisayara iletiliyor'); render();
-  });
-  // etsy
-  $('#etsy-save')?.addEventListener('click', async () => {
-    let n = 0;
-    for (const i of $$('[data-etsy]')) { const [s, k] = i.dataset.etsy.split('|'); if (i.value.trim() === '') continue; const v = num(i.value); const cur = S.view.etsy[s]?.[k]; const pe = [...S.pend.etsy].reverse().find(x => x.s === s && x.k === k); if ((pe ? pe.v : cur) === v) continue; S.pend.etsy.push({ id: rid(), s, k, m: S.view.month, v, at: new Date().toISOString() }); n++; }
-    if (!n) return toast('Değişiklik yok'); await savePend(); toast('Kaydedildi'); render();
-  });
-  $('#lock')?.addEventListener('click', () => location.reload());
-  $('#forget')?.addEventListener('click', () => { if (confirm('Bu telefondaki bağlantı silinsin mi? Tekrar bağlanmak için yeni QR gerekir.')) { Object.values(LS).forEach(k => lsSet(k, null)); location.reload(); } });
-}
-
-// ---------------------------------------------------------------- açılış: bağlantı + PIN
-function pinScreen({ title, sub, onPin, second }) {
-  $('#app').innerHTML = `<main style="padding-top:40px"><div class="center"><img src="icon-192.png" style="width:72px;border-radius:18px" alt=""><h2>${esc(title)}</h2><div class="muted small">${sub}</div></div>
-    <div class="card" style="margin-top:20px"><input id="pin" class="pin" type="password" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="••••">
-    <button class="btn p w" id="go" style="margin-top:12px">Devam</button><div id="perr" class="small center" style="color:var(--red);margin-top:8px"></div></div>${second || ''}</main>`;
-  const go = async () => { const v = $('#pin').value.trim(); if (!/^\d{4,6}$/.test(v)) { $('#perr').textContent = '4-6 haneli rakam gir'; return; } $('#go').disabled = true; try { await onPin(v); } catch (e) { $('#perr').textContent = e.message || 'Hata'; $('#go').disabled = false; } };
-  $('#go').onclick = go; $('#pin').onkeydown = (e) => { if (e.key === 'Enter') go(); }; setTimeout(() => $('#pin').focus(), 50);
-}
-async function start(cfg) {
-  S.cfg = cfg; S.hash = await linkHash(cfg.i, cfg.k);
-  try { const c = lsGet(LS.cache); if (c) { const x = await popen(c, cfg.k); S.view = x.v; S.viewAt = x.at; } } catch { /* yok */ }
-  try { const p = lsGet(LS.pend); if (p) S.pend = { steps: [], seen: [], etsy: [], add: [], ...(await popen(p, cfg.k)) }; } catch { /* yok */ }
-  render(); refreshNow(true);
-  setInterval(() => { if (document.visibilityState === 'visible') refreshNow(true); }, 60000);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshNow(true); });
-  window.addEventListener('online', () => refreshNow(true));
-}
-async function boot() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-  const m = location.hash.match(/c=([A-Za-z0-9_-]+)/);
-  if (m) {
-    let cfg; try { cfg = JSON.parse(new TextDecoder().decode(unb64u(m[1]))); } catch { cfg = null; }
-    history.replaceState(null, '', location.pathname);
-    if (!cfg?.u || !cfg?.k || !cfg?.i) { $('#app').innerHTML = '<main><div class="card err">Bağlantı bozuk. Bilgisayardan yeni QR iste.</div></main>'; return; }
-    let firstPin = '';
-    const ask = () => pinScreen({ title: 'Telefonu bağla', sub: `<b>${esc(cfg.n || '')}</b><br>Bu telefona 4-6 haneli bir PIN belirle. Uygulamayı her açtığında sorulur.`, onPin: async (p) => {
-      if (!firstPin) { firstPin = p; pinScreen({ title: 'PIN tekrar', sub: 'Aynı PIN\'i bir daha yaz', onPin: async (p2) => { if (p2 !== firstPin) { firstPin = ''; throw new Error('PIN\'ler aynı değil, baştan'); } await saveCfg(cfg, p2); lsSet(LS.cache, null); lsSet(LS.pend, null); toast('Bağlandı'); start(cfg); } }); }
-    } });
-    ask(); return;
-  }
-  if (!lsGet(LS.cfg)) {
-    $('#app').innerHTML = `<main style="padding-top:40px" class="center"><img src="icon-192.png" style="width:80px;border-radius:20px" alt=""><h2>Mağaza Takip Cep</h2><div class="card muted">Bu telefon henüz bağlı değil.<br><br>Bilgisayardaki Mağaza Takip programında <b>Daha fazla → Telefon (Cep)</b> bölümünden QR oluştur ve telefonun kamerasıyla okut.</div></main>`;
-    return;
-  }
-  let tries = 0;
-  pinScreen({ title: 'Mağaza Takip Cep', sub: esc(JSON.parse(lsGet(LS.cfg)).n || '') + '<br>PIN\'ini gir', onPin: async (p) => {
-    try { const cfg = await loadCfg(p); start(cfg); } catch { tries++; await new Promise(r => setTimeout(r, Math.min(8000, 400 * 2 ** tries))); throw new Error('PIN yanlış'); }
-  }, second: '<div class="center small muted" style="margin-top:16px"><a href="#" id="reset" style="color:var(--muted)">PIN\'i unuttum (bağlantıyı sil)</a></div>' });
-  $('#reset').onclick = (e) => { e.preventDefault(); if (confirm('Bağlantı silinsin mi? Bilgisayardan yeni QR gerekir.')) { Object.values(LS).forEach(k => lsSet(k, null)); location.reload(); } };
-}
-boot();
+    <button class="btn w" id="forget" style="color:var(--red)">Bu telefondan ba\u011Flant\u0131y\u0131 sil</button>
+    <div class="small muted center" style="margin-top:18px">Ma\u011Faza Takip Cep \xB7 veri u\xE7tan uca \u015Fifreli</div>`}function u(){const e=o("#app");if(!s.view){e.innerHTML=`<main><div class="card ${s.err?"err":""}" style="margin-top:30px">${s.busy?"Bilgisayardan veriler al\u0131n\u0131yor\u2026":r(s.err||"Bekleniyor\u2026")}</div>${s.busy?"":'<button class="btn p w" id="retry">Tekrar dene</button>'}</main>`,o("#retry")?.addEventListener("click",()=>w());return}const t=s.view,a=t.stores.some(c=>c.manage),n=!!t.etsy&&Object.keys(t.etsy).length,i=t.orders.filter(f).length,d=[["today",M()?"S\u0131ra":"Bug\xFCn","home",i],["orders","Sipari\u015Fler","list"],...a?[["add","Ekle","plus"]]:[],...n?[["etsy","Etsy","chart"]]:[],["set","Ayarlar","gear"]],l={today:M()?he:be,orders:ke,add:we,etsy:xe,set:Se}[s.tab]?.()||"",p=D();e.innerHTML=`<header><img src="icon-192.png" alt=""><div class="grow"><div class="t">Ma\u011Faza Cep</div><div class="s">${s.busy?"yenileniyor\u2026":`g\xFCncel: ${T(t.at)}`}${p?` \xB7 ${p} de\u011Fi\u015Fiklik g\xF6nderiliyor`:""}</div></div>
+    ${t.stores.length>1?`<select id="st" style="width:auto;max-width:42%;background:rgba(255,255,255,.15);color:#fff;border:0;padding:8px"><option value="" style="color:#000">T\xFCm ma\u011Fazalar</option>${t.stores.map(c=>`<option value="${c.id}" ${s.store===c.id?"selected":""} style="color:#000">${r(c.name)}</option>`).join("")}</select>`:""}
+    <button id="rf">\u27F3</button></header>
+    <main>${s.err?`<div class="card warn small">${r(s.err)}</div>`:""}${l}</main>
+    <nav>${d.map(([c,m,te,q])=>`<button data-tab="${c}" class="${s.tab===c?"on":""}">${oe(te)}${m}${q?`<i class="b">${q}</i>`:""}</button>`).join("")}</nav>`,Ee()}function y(e){const t=document.createElement("div");t.className="toast",t.textContent=e,document.body.appendChild(t),setTimeout(()=>t.remove(),2600)}function Te(e){const t=s.view.orders.find(n=>n.id===e);if(!t)return;const a=document.createElement("div");a.className="sheet",a.innerHTML=`<div>${Z(t)}</div>`,document.body.appendChild(a),a.addEventListener("click",n=>{if(n.target===a||n.target.closest("[data-close]")){a.remove(),u();return}const i=n.target.closest("[data-copy]");if(i){const l=decodeURIComponent(i.dataset.copy);(navigator.clipboard?.writeText(l)||Promise.reject()).then(()=>y("Kopyaland\u0131"),()=>{prompt("Kopyala:",l)});return}const d=n.target.closest("[data-tick],[data-seen]");d&&(X(d),a.querySelector("div").innerHTML=Z(t))})}async function X(e){if(e.dataset.tick){const[t,a,n]=e.dataset.tick.split("|");s.pend.steps.push({id:S(),o:t,k:a,done:n==="1",at:new Date().toISOString()});const i=new Map;s.pend.steps.forEach(d=>i.set(d.o+d.k,d.id)),s.pend.steps=s.pend.steps.filter(d=>i.get(d.o+d.k)===d.id),y(n==="1"?"\u0130\u015Faretlendi \u2713":"\u0130\u015Faret kald\u0131r\u0131ld\u0131"),await k()}else e.dataset.seen&&(s.pend.seen.some(t=>t.o===e.dataset.seen)||s.pend.seen.push({id:S(),o:e.dataset.seen,at:new Date().toISOString()}),y("G\xF6rd\xFCm kaydedildi"),await k())}function Ee(){h("[data-tab]").forEach(a=>a.onclick=()=>{s.tab=a.dataset.tab,u(),window.scrollTo(0,0)}),o("#rf")?.addEventListener("click",()=>w()),o("#st")?.addEventListener("change",a=>{s.store=a.target.value,u()}),h("[data-open]").forEach(a=>a.addEventListener("click",n=>{n.target.closest("button")||Te(a.dataset.open)})),h("[data-tick],[data-seen]").forEach(a=>a.addEventListener("click",async n=>{n.stopPropagation(),await X(a),u()})),o("[data-seenall]")?.addEventListener("click",async()=>{for(const a of s.view.orders.filter(f))s.pend.seen.push({id:S(),o:a.id,at:new Date().toISOString()});await k(),y("Hepsi g\xF6r\xFCld\xFC"),u()}),h("[data-filter]").forEach(a=>a.onclick=()=>{s.filter=a.dataset.filter,u()});const e=o("#q");e&&(e.oninput=()=>{s.q=e.value;const a=e.selectionStart;u();const n=o("#q");n.focus(),n.setSelectionRange(a,a)});const t=o("#add-t");t&&(t.oninput=()=>{s.addText=t.value}),o("#add-s")?.addEventListener("change",a=>{s.addStore=a.target.value}),o("#parse")?.addEventListener("click",()=>{const a=o("#add-t").value;if(!a.trim())return y("\xD6nce sipari\u015F yaz\u0131s\u0131n\u0131 yap\u0131\u015Ft\u0131r");try{s.parsed=se(a),s.box=""}catch(n){y("Okunamad\u0131: "+n.message)}u()}),h("[data-box]").forEach(a=>a.onclick=()=>{s.box=a.dataset.box,u()}),o("#send-add")?.addEventListener("click",async()=>{const a=s.parsed,n=o("#add-s").value;s.pend.add.push({id:S(),s:n,text:s.addText,box:s.box||"",at:new Date().toISOString(),label:`${a.buyerName||""} #${a.orderNo||""}`}),s.parsed=null,s.addText="",s.box="",await k(),y("G\xF6nderildi, bilgisayara iletiliyor"),u()}),o("#etsy-save")?.addEventListener("click",async()=>{let a=0;for(const n of h("[data-etsy]")){const[i,d]=n.dataset.etsy.split("|");if(n.value.trim()==="")continue;const l=ie(n.value),p=s.view.etsy[i]?.[d],c=[...s.pend.etsy].reverse().find(m=>m.s===i&&m.k===d);(c?c.v:p)!==l&&(s.pend.etsy.push({id:S(),s:i,k:d,m:s.view.month,v:l,at:new Date().toISOString()}),a++)}if(!a)return y("De\u011Fi\u015Fiklik yok");await k(),y("Kaydedildi"),u()}),o("#lock")?.addEventListener("click",()=>location.reload()),o("#forget")?.addEventListener("click",()=>{confirm("Bu telefondaki ba\u011Flant\u0131 silinsin mi? Tekrar ba\u011Flanmak i\xE7in yeni QR gerekir.")&&(Object.values(v).forEach(a=>g(a,null)),location.reload())})}function H({title:e,sub:t,onPin:a,second:n}){o("#app").innerHTML=`<main style="padding-top:40px"><div class="center"><img src="icon-192.png" style="width:72px;border-radius:18px" alt=""><h2>${r(e)}</h2><div class="muted small">${t}</div></div>
+    <div class="card" style="margin-top:20px"><input id="pin" class="pin" type="password" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="\u2022\u2022\u2022\u2022">
+    <button class="btn p w" id="go" style="margin-top:12px">Devam</button><div id="perr" class="small center" style="color:var(--red);margin-top:8px"></div></div>${n||""}</main>`;const i=async()=>{const d=o("#pin").value.trim();if(!/^\d{4,6}$/.test(d)){o("#perr").textContent="4-6 haneli rakam gir";return}o("#go").disabled=!0;try{await a(d)}catch(l){o("#perr").textContent=l.message||"Hata",o("#go").disabled=!1}};o("#go").onclick=i,o("#pin").onkeydown=d=>{d.key==="Enter"&&i()},setTimeout(()=>o("#pin").focus(),50)}async function ee(e){s.cfg=e,s.hash=await ae(e.i,e.k);try{const t=C(v.cache);if(t){const a=await O(t,e.k);s.view=a.v,s.viewAt=a.at}}catch{}try{const t=C(v.pend);t&&(s.pend={steps:[],seen:[],etsy:[],add:[],...await O(t,e.k)})}catch{}u(),w(!0),setInterval(()=>{document.visibilityState==="visible"&&w(!0)},6e4),document.addEventListener("visibilitychange",()=>{document.visibilityState==="visible"&&w(!0)}),window.addEventListener("online",()=>w(!0))}async function Be(){"serviceWorker"in navigator&&navigator.serviceWorker.register("sw.js").catch(()=>{});const e=location.hash.match(/c=([A-Za-z0-9_-]+)/);if(e){let a;try{a=JSON.parse(new TextDecoder().decode(L(e[1])))}catch{a=null}if(history.replaceState(null,"",location.pathname),!a?.u||!a?.k||!a?.i){o("#app").innerHTML='<main><div class="card err">Ba\u011Flant\u0131 bozuk. Bilgisayardan yeni QR iste.</div></main>';return}let n="";H({title:"Telefonu ba\u011Fla",sub:`<b>${r(a.n||"")}</b><br>Bu telefona 4-6 haneli bir PIN belirle. Uygulamay\u0131 her a\xE7t\u0131\u011F\u0131nda sorulur.`,onPin:async d=>{n||(n=d,H({title:"PIN tekrar",sub:"Ayn\u0131 PIN'i bir daha yaz",onPin:async l=>{if(l!==n)throw n="",new Error("PIN'ler ayn\u0131 de\u011Fil, ba\u015Ftan");await ce(a,l),g(v.cache,null),g(v.pend,null),y("Ba\u011Fland\u0131"),ee(a)}}))}});return}if(!C(v.cfg)){o("#app").innerHTML='<main style="padding-top:40px" class="center"><img src="icon-192.png" style="width:80px;border-radius:20px" alt=""><h2>Ma\u011Faza Takip Cep</h2><div class="card muted">Bu telefon hen\xFCz ba\u011Fl\u0131 de\u011Fil.<br><br>Bilgisayardaki Ma\u011Faza Takip program\u0131nda <b>Daha fazla \u2192 Telefon (Cep)</b> b\xF6l\xFCm\xFCnden QR olu\u015Ftur ve telefonun kameras\u0131yla okut.</div></main>';return}let t=0;H({title:"Ma\u011Faza Takip Cep",sub:r(JSON.parse(C(v.cfg)).n||"")+"<br>PIN'ini gir",onPin:async a=>{try{const n=await pe(a);ee(n)}catch{throw t++,await new Promise(n=>setTimeout(n,Math.min(8e3,400*2**t))),new Error("PIN yanl\u0131\u015F")}},second:`<div class="center small muted" style="margin-top:16px"><a href="#" id="reset" style="color:var(--muted)">PIN'i unuttum (ba\u011Flant\u0131y\u0131 sil)</a></div>`}),o("#reset").onclick=a=>{a.preventDefault(),confirm("Ba\u011Flant\u0131 silinsin mi? Bilgisayardan yeni QR gerekir.")&&(Object.values(v).forEach(n=>g(n,null)),location.reload())}}Be();
